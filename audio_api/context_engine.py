@@ -585,12 +585,15 @@ class OllamaContextEngine:
         enabled: bool = False,
         timeout_sec: float | None = None,
         mock_response: dict[str, Any] | None = None,
+        retriever: Any | None = None,
+        retrieval_enabled: bool = False,
+        top_k_retrieval: int = 3,
     ) -> dict[str, Any]:
-        """Reviews transcript with conversation memory and LLM.
+        """Reviews transcript with conversation memory, optional hybrid retrieval, and LLM.
         
         If enabled is False, gracefully returns original dictionary result.
-        When enabled is True, applies dynamic domain context knowledge and
-        queries Ollama Qwen with safe fallback.
+        When enabled is True, applies dynamic domain context knowledge, retrieves supporting
+        evidence if retrieval_enabled is True, and queries Ollama Qwen with safe fallback.
         """
         session = self.session_manager.get_or_create(session_id, domain, subject, topic)
         actual_timeout = timeout_sec or self.timeout_sec
@@ -608,6 +611,9 @@ class OllamaContextEngine:
             "uncertain_segments": [],
             "requires_audio_recheck": False,
             "context_latency_ms": 0.0,
+            "retrieval_latency_ms": 0.0,
+            "retrieved_references": [],
+            "retrieval_enabled": retrieval_enabled,
             "llm_reviewed": False,
             "status": "disabled" if not enabled else "fallback",
             "domain": session.domain,
@@ -639,6 +645,28 @@ class OllamaContextEngine:
             topic=topic
         )
 
+        # Optional Hybrid Retrieval of approved knowledge passages
+        retrieved_passages = []
+        retrieved_references = []
+        retrieval_latency_ms = 0.0
+        if retrieval_enabled and retriever is not None:
+            try:
+                t_ret0 = time.time()
+                retrieved_passages = retriever.search(
+                    clean_input, domain=session.domain, top_k=top_k_retrieval
+                )
+                retrieval_latency_ms = round((time.time() - t_ret0) * 1000, 1)
+                for p in retrieved_passages:
+                    retrieved_references.append({
+                        "id": getattr(p, "id", str(p)),
+                        "domain": getattr(p, "domain", session.domain),
+                        "text": getattr(p, "text", "")[:120],
+                        "score": getattr(p, "rrf_score", 0.0),
+                        "source": getattr(p, "source", "knowledge_base"),
+                    })
+            except Exception as exc:
+                logger.warning("Hybrid retrieval failed during review: %s", exc)
+
         reviewed_payload: dict[str, Any] | None = None
 
         is_fallback = False
@@ -658,11 +686,26 @@ class OllamaContextEngine:
                     for t in recent_turns
                 )
 
+            # Build retrieved knowledge guidance if passages were found
+            retrieval_context_text = ""
+            if retrieved_passages:
+                retrieval_context_text = (
+                    "Relevant Approved Knowledge (Supporting Evidence Only - NOT Spoken Words):\n"
+                    + "\n".join(f"- [{getattr(p, 'domain', session.domain).upper()}] {getattr(p, 'text', '')}" for p in retrieved_passages)
+                    + "\n\n"
+                    "STRICT EVIDENCE RULES:\n"
+                    "1. Retrieved knowledge is background evidence only. Never alter clearly spoken words just because a term is mentioned.\n"
+                    "2. Do NOT invent words, diagnoses, medications, dosages, quantities, units, or instructions.\n"
+                    "3. Preserve negation (not/never), numbers, and original acoustic meaning.\n"
+                    "4. If evidence is ambiguous, preserve the candidate transcript and record the word in 'uncertain_segments'.\n\n"
+                )
+
             user_prompt = (
                 f"{history_text}\n\n"
+                f"{retrieval_context_text}"
                 f"Candidate Transcript: \"{clean_input}\"\n"
                 f"Original Acoustic ASR: \"{original_transcript}\"\n\n"
-                "Review this candidate sentence considering the domain, subject, and conversation history. "
+                "Review this candidate sentence considering the domain, subject, conversation history, and supporting evidence. "
                 "Apply appropriate technical abbreviation recovery or domain disambiguation if supported by context. "
                 "Output strictly valid JSON."
             )
@@ -753,6 +796,9 @@ class OllamaContextEngine:
             "uncertain_segments": uncertain_segments,
             "requires_audio_recheck": requires_recheck,
             "context_latency_ms": latency_ms,
+            "retrieval_latency_ms": retrieval_latency_ms,
+            "retrieved_references": retrieved_references,
+            "retrieval_enabled": retrieval_enabled,
             "llm_reviewed": True,
             "status": review_status,
             "reason": fallback_reason,

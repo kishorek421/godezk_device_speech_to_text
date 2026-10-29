@@ -10,9 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
 
+import asyncio
 import numpy as np
 import soundfile as sf
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from scipy.signal import resample_poly
 from walker_audio.dictionary_corrector import correct_transcript
@@ -260,7 +262,7 @@ class Services:
 
             manifest_entry = {
                 "sample_id": sample_id,
-                "audio_filepath": str(wav_path.as_posix()),
+                "audio_filepath": wav_path.as_posix(),
                 "duration": round(duration, 3),
                 "predicted_transcript": transcript,
                 "raw_asr_text": raw_asr,
@@ -295,6 +297,9 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+# Concurrency barrier: Ensure only 1 GPU inference pipeline runs at any moment to prevent VRAM exhaustion
+gpu_inference_semaphore = asyncio.Semaphore(1)
 
 
 def get_services() -> Services:
@@ -434,12 +439,28 @@ async def transcribe(
     dict_enabled = (
         dictionary_enabled
         if isinstance(dictionary_enabled, bool)
-        else str(dictionary_enabled).strip().lower() not in {"0", "false", "no", "off", "disable", "disabled"}
+        else dictionary_enabled.strip().lower() not in {"0", "false", "no", "off", "disable", "disabled"}
     )
+    # Protect GPU from concurrent memory exhaustion and queue contention
     try:
-        return service.transcribe(mono, mode=mode, domain=domain, dictionary_enabled=dict_enabled)
+        await asyncio.wait_for(gpu_inference_semaphore.acquire(), timeout=0.1)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="GPU inference is busy processing another request. Please retry shortly.",
+            headers={"Retry-After": "2"},
+        )
+
+    try:
+        # Offload synchronous inference to worker threadpool so FastAPI event loop remains responsive
+        return await run_in_threadpool(
+            service.transcribe, mono, mode=mode, domain=domain, dictionary_enabled=dict_enabled
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Transcription failed: {exc}"
         ) from exc
+    finally:
+        gpu_inference_semaphore.release()
+
 

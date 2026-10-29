@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
@@ -12,7 +13,7 @@ class CanaryTranscriber:
         "medical": "Transcribe the following clinical and medical speech verbatim without omitting or changing words: ",
         "education": "Transcribe the following academic and scientific speech verbatim without omitting or changing words: ",
         "industry": "Transcribe the following industrial and operational speech verbatim without omitting or changing words: ",
-        "general": "Transcribe the following speech verbatim without omitting or changing words: ",
+        "general": "Transcribe the following: ",
     }
 
 
@@ -85,15 +86,19 @@ class CanaryTranscriber:
         if domain not in self.SALM_DOMAIN_PROMPTS:
             domain = "general"
 
-        with NamedTemporaryFile(suffix=".wav") as temporary:
-            sf.write(temporary.name, audio, sample_rate)
+        temp_file = NamedTemporaryFile(suffix=".wav", delete=False)
+        temp_path = temp_file.name
+        temp_file.close()
+
+        try:
+            sf.write(temp_path, audio, sample_rate)
 
             with torch.inference_mode():
                 if mode == "asr":
                     # Mode A: Step 1: Plain ASR (audio -> raw acoustic text)
                     base_prompt = f"Transcribe the following: {self._model.audio_locator_tag}"
                     asr_ids = self._model.generate(
-                        prompts=[[{"role": "user", "content": base_prompt, "audio": [temporary.name]}]],
+                        prompts=[[{"role": "user", "content": base_prompt, "audio": [temp_path]}]],
                         max_new_tokens=128,
                     )
                     raw_asr_text = self._model.tokenizer.ids_to_text(asr_ids[0].cpu()).strip()
@@ -105,10 +110,17 @@ class CanaryTranscriber:
                         f"Understand and output the exact intended terminology or sentence. "
                         f"Output only the final transcript."
                     )
-                    llm_ids = self._model.generate(
-                        prompts=[[{"role": "user", "content": llm_text_prompt}]],
-                        max_new_tokens=64,
-                    )
+                    if hasattr(self._model, "llm") and hasattr(self._model.llm, "disable_adapter"):
+                        with self._model.llm.disable_adapter():
+                            llm_ids = self._model.generate(
+                                prompts=[[{"role": "user", "content": llm_text_prompt}]],
+                                max_new_tokens=64,
+                            )
+                    else:
+                        llm_ids = self._model.generate(
+                            prompts=[[{"role": "user", "content": llm_text_prompt}]],
+                            max_new_tokens=64,
+                        )
                     final_text = self._model.tokenizer.ids_to_text(llm_ids[0].cpu()).strip()
                     if not final_text:
                         final_text = raw_asr_text
@@ -125,7 +137,7 @@ class CanaryTranscriber:
                     salm_prompt_prefix = self.SALM_DOMAIN_PROMPTS[domain]
                     full_prompt = f"{salm_prompt_prefix}{self._model.audio_locator_tag}"
                     answer_ids = self._model.generate(
-                        prompts=[[{"role": "user", "content": full_prompt, "audio": [temporary.name]}]],
+                        prompts=[[{"role": "user", "content": full_prompt, "audio": [temp_path]}]],
                         max_new_tokens=128,
                     )
                     final_text = self._model.tokenizer.ids_to_text(answer_ids[0].cpu()).strip()
@@ -136,6 +148,12 @@ class CanaryTranscriber:
                         "processing_mode": "salm",
                         "domain": domain,
                     }
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
 
 
 class TitaNetVerifier:

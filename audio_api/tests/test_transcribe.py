@@ -4,6 +4,8 @@ from app.main import Services, Settings
 
 
 class FakeTranscriber:
+    runtime_info = {"is_loaded": True, "actual_device": "cuda", "actual_dtype": "bfloat16"}
+
     def transcribe(self, audio: np.ndarray, sample_rate: int) -> str:
         return "walker can you hear me"
 
@@ -55,3 +57,63 @@ def test_handles_empty_audio():
     result = make_service().transcribe(np.array([], dtype=np.float32))
 
     assert result.reason == "empty_audio"
+
+
+def test_api_transcribe_and_concurrency_guard():
+    import io
+    import soundfile as sf
+    from starlette.testclient import TestClient
+    from app.main import app, get_services, gpu_inference_semaphore
+
+    test_service = make_service()
+    app.dependency_overrides[get_services] = lambda: test_service
+    client = TestClient(app)
+
+    try:
+        # 1. Health check returns 200
+        health_resp = client.get("/health")
+        assert health_resp.status_code == 200
+        assert health_resp.json()["status"] == "ok"
+
+        # 2. Transcribe valid audio returns 200 and transcript
+        rate = 16000
+        silence = np.zeros(rate // 2, dtype=np.float32)
+        speech = 0.4 * np.sin(2 * np.pi * 220 * np.arange(rate) / rate).astype(np.float32)
+        audio = np.concatenate([silence, speech, silence])
+        buf = io.BytesIO()
+        sf.write(buf, audio, rate, format="WAV")
+        wav_bytes = buf.getvalue()
+
+        resp = client.post(
+            "/v1/transcribe",
+            files={"audio": ("test.wav", wav_bytes, "audio/wav")},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["transcript"] == "walker can you hear me"
+        assert data["reason"] is None
+
+        # 3. When GPU semaphore is locked, second concurrent request receives 429
+        import asyncio
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(gpu_inference_semaphore.acquire())
+        try:
+            busy_resp = client.post(
+                "/v1/transcribe",
+                files={"audio": ("test2.wav", wav_bytes, "audio/wav")},
+            )
+            assert busy_resp.status_code == 429
+            assert "busy" in busy_resp.json()["detail"].lower()
+        finally:
+            gpu_inference_semaphore.release()
+            loop.close()
+
+        # 4. After semaphore release, subsequent requests succeed
+        recovered_resp = client.post(
+            "/v1/transcribe",
+            files={"audio": ("test3.wav", wav_bytes, "audio/wav")},
+        )
+        assert recovered_resp.status_code == 200
+    finally:
+        app.dependency_overrides.clear()
+

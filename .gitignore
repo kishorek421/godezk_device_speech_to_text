@@ -96,8 +96,16 @@ temp/
 tmp/
 
 # ==============================================================================
-# Speaker Registry / Biometric Voiceprints (Local user profiles)
+# Databases & Local Caches
 # ==============================================================================
+*.db
+*.sqlite
+*.sqlite3
+*_summary.json
+*_report.csv
+config/snapshots/
+config/verified_feedback_log.jsonl
+config/learning_suggestions.json
 config/speaker_registry.json
 
 # ==============================================================================

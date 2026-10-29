@@ -35,12 +35,31 @@ def verify_sample(
     sample: dict[str, Any],
     ground_truth: str,
     reviewer: str = "human_curator",
+    feed_to_learning_workflow: bool = True,
 ) -> dict[str, Any]:
     """Transitions a sample from status='predicted' to status='verified'."""
     verified = dict(sample)
     verified["verified_transcript"] = ground_truth.strip()
     verified["status"] = "verified"
     verified["reviewer"] = reviewer
+
+    if feed_to_learning_workflow:
+        try:
+            from walker_audio.retrieval.learning_manager import DailyLearningManager
+            lm = DailyLearningManager()
+            pred = sample.get("predicted_transcript") or sample.get("original_transcript") or sample.get("transcript") or ""
+            if pred and pred.strip() != ground_truth.strip():
+                lm.record_verified_feedback(
+                    original_transcript=pred,
+                    verified_transcript=ground_truth.strip(),
+                    domain=sample.get("domain", "general"),
+                    source_sample_id=sample.get("audio_filepath") or sample.get("id"),
+                    speaker_id=sample.get("speaker_id"),
+                    reviewer=reviewer,
+                )
+        except Exception:
+            pass
+
     return verified
 
 

@@ -4,7 +4,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from typing import Annotated
+import time
+from typing import Annotated, Any
 
 # Ensure walker_audio package directory is on sys.path
 _ROOT_DIR = Path(__file__).resolve().parent
@@ -12,7 +13,7 @@ _WALKER_PATH = str(_ROOT_DIR / "walker_audio")
 if _WALKER_PATH not in sys.path:
     sys.path.insert(0, _WALKER_PATH)
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import HTMLResponse, FileResponse
 import numpy as np
 import requests
@@ -266,8 +267,103 @@ def test_dictionary_endpoint(text: Annotated[str, Form()], domain: Annotated[str
 
 
 from audio_api.context_engine import get_context_engine
+from walker_audio.retrieval import HybridContextRetriever, DailyLearningManager
+from pydantic import BaseModel
 
 context_engine = get_context_engine()
+retriever = HybridContextRetriever()
+try:
+    retriever.bootstrap_default_knowledge()
+except Exception as exc:
+    print(f"[RETRIEVAL] Warning during bootstrap: {exc}")
+
+learning_manager = DailyLearningManager()
+
+
+class SuggestionActionRequest(BaseModel):
+    suggestion_id: str
+    reviewer: str = "human_curator"
+    reason: str = ""
+
+
+class FeedbackRequest(BaseModel):
+    original_transcript: str
+    verified_transcript: str
+    domain: str = "general"
+    source_sample_id: str | None = None
+    reviewer: str = "human_curator"
+    notes: str | None = None
+
+
+@app.get("/api/retrieval/stats")
+def get_retrieval_stats():
+    return retriever.get_index_stats()
+
+
+@app.get("/api/learning/suggestions")
+def get_learning_suggestions(status: str | None = None):
+    return {"status": "ok", "suggestions": learning_manager.get_suggestions(status)}
+
+
+@app.post("/api/learning/generate-suggestions")
+def generate_suggestions_endpoint(min_frequency: int = 1):
+    new_sugs = learning_manager.generate_candidate_suggestions(min_frequency=min_frequency)
+    return {"status": "ok", "generated_count": len(new_sugs), "suggestions": new_sugs}
+
+
+@app.post("/api/learning/approve")
+def approve_suggestion_endpoint(req: SuggestionActionRequest):
+    try:
+        updated = learning_manager.approve_suggestion(
+            req.suggestion_id, reviewer=req.reviewer, retriever=retriever
+        )
+        return {"status": "ok", "suggestion": updated}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Suggestion not found")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/learning/reject")
+def reject_suggestion_endpoint(req: SuggestionActionRequest):
+    try:
+        updated = learning_manager.reject_suggestion(
+            req.suggestion_id, reviewer=req.reviewer, reason=req.reason
+        )
+        return {"status": "ok", "suggestion": updated}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Suggestion not found")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/learning/rollback")
+def rollback_suggestion_endpoint(req: SuggestionActionRequest):
+    try:
+        updated = learning_manager.rollback_suggestion(
+            req.suggestion_id, retriever=retriever
+        )
+        return {"status": "ok", "suggestion": updated}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Suggestion not found")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/learning/feedback")
+def submit_feedback_endpoint(req: FeedbackRequest):
+    try:
+        entry = learning_manager.record_verified_feedback(
+            original_transcript=req.original_transcript,
+            verified_transcript=req.verified_transcript,
+            domain=req.domain,
+            source_sample_id=req.source_sample_id,
+            reviewer=req.reviewer,
+            notes=req.notes,
+        )
+        return {"status": "ok", "feedback": entry}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/api/context/session/{session_id}")
@@ -283,6 +379,97 @@ def reset_session_context(session_id: Annotated[str, Form()] = "default_session"
     success = context_engine.session_manager.reset(session_id)
     return {"status": "reset" if success else "not_found", "session_id": session_id}
 
+from walker_audio.live_caption_engine import LiveCaptionSession
+from walker_audio.asr_client import RemoteAsrClient
+
+remote_asr_client = RemoteAsrClient(
+    base_url=REMOTE_GPU_API,
+    connect_timeout=3.0,
+    interim_read_timeout=5.0,
+    final_read_timeout=15.0,
+    failure_threshold=3,
+    cooldown_seconds=15.0,
+)
+
+
+def live_asr_transcribe(
+    wav_bytes: bytes, mode: str = "salm", domain: str = "general", dict_enabled: bool = False, is_interim: bool = False
+) -> tuple[str, float, str]:
+    """Calls RemoteAsrClient with circuit breaker protection and bounded connect/read timeouts."""
+    return remote_asr_client.transcribe(
+        wav_bytes, mode=mode, domain=domain, dict_enabled=dict_enabled, is_interim=is_interim
+    )
+
+
+def live_speaker_identify(wav_bytes: bytes, duration_sec: float) -> dict[str, Any]:
+    """Runs CAM++ speaker identification on finalized live segment."""
+    threshold = 0.62 if duration_sec < 1.2 else 0.68
+    return speaker_registry.identify(wav_bytes, sample_rate=16000, threshold=threshold)
+
+
+@app.get("/api/asr/diagnostics")
+def get_asr_diagnostics_endpoint():
+    """Diagnoses network connectivity, TCP handshake, HTTP health, and circuit breaker status."""
+    diag = remote_asr_client.diagnose_connection()
+    cb_status = remote_asr_client.circuit_breaker.get_status()
+    return {"status": "ok", "diagnostics": diag, "circuit_breaker": cb_status}
+
+
+
+@app.websocket("/api/live/ws")
+async def live_captions_websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+
+    async def send_event(event_data: dict[str, Any]) -> None:
+        try:
+            await websocket.send_json(event_data)
+        except Exception:
+            pass
+
+    session = LiveCaptionSession(
+        session_id=f"ws_{int(time.time() * 1000)}",
+        sample_rate=16000,
+        domain="general",
+        mode="salm",
+        dictionary_enabled=True,
+        on_event=send_event,
+        asr_transcribe_fn=live_asr_transcribe,
+        speaker_identify_fn=live_speaker_identify,
+        dictionary_correct_fn=correct_transcript,
+        min_interim_interval_ms=400,
+    )
+
+    try:
+        while True:
+            message = await websocket.receive()
+            if "bytes" in message and message["bytes"]:
+                raw_bytes = message["bytes"]
+                samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                await session.push_audio_frame(samples)
+            elif "text" in message and message["text"]:
+                import json
+                try:
+                    payload = json.loads(message["text"])
+                    msg_type = payload.get("type", "")
+                    if msg_type == "config":
+                        session.domain = payload.get("domain", session.domain)
+                        session.mode = payload.get("mode", session.mode)
+                        session.dictionary_enabled = bool(payload.get("dictionary_enabled", session.dictionary_enabled))
+                        await websocket.send_json({"event": "config_ack", "domain": session.domain, "mode": session.mode})
+                    elif msg_type == "ping":
+                        await websocket.send_json({"event": "pong", "time": time.time()})
+                    elif msg_type == "reset":
+                        session.reset()
+                        await websocket.send_json({"event": "reset_ack"})
+                except Exception as exc:
+                    await websocket.send_json({"event": "error", "message": f"Malformed JSON: {exc}"})
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        print(f"[LIVE-WS] Connection error: {exc}")
+    finally:
+        session.reset()
+
 
 @app.post("/api/transcribe")
 async def transcribe_proxy(
@@ -296,6 +483,7 @@ async def transcribe_proxy(
     topic: Annotated[str, Form()] = "",
     session_id: Annotated[str, Form()] = "default_session",
     context_review_enabled: Annotated[str, Form()] = "false",
+    retrieval_enabled: Annotated[str, Form()] = "false",
 ):
 
     content = await audio.read()
@@ -321,7 +509,7 @@ async def transcribe_proxy(
     except Exception:
         pass
 
-    dict_enabled = str(dictionary_enabled).strip().lower() not in {
+    dict_enabled = dictionary_enabled.strip().lower() not in {
         "0", "false", "no", "off", "disable", "disabled"
     }
 
@@ -378,7 +566,10 @@ async def transcribe_proxy(
                 result["transcript"] = dict_res["corrected_transcript"]
 
             # Optional LLM Context-Review Stage (Ollama Qwen) - Disabled by default
-            llm_enabled = str(context_review_enabled).strip().lower() in {
+            llm_enabled = context_review_enabled.strip().lower() in {
+                "1", "true", "yes", "on", "enable", "enabled"
+            }
+            retrieval_on = retrieval_enabled.strip().lower() in {
                 "1", "true", "yes", "on", "enable", "enabled"
             }
             context_res = context_engine.review_transcript(
@@ -390,8 +581,13 @@ async def transcribe_proxy(
                 topic=topic,
                 speaker_id=spk_id,
                 enabled=llm_enabled,
+                retriever=retriever,
+                retrieval_enabled=retrieval_on,
             )
             result["llm_context_enabled"] = llm_enabled
+            result["retrieval_enabled"] = retrieval_on
+            result["retrieved_references"] = context_res.get("retrieved_references", [])
+            result["retrieval_latency_ms"] = context_res.get("retrieval_latency_ms", 0.0)
             result["reviewed_transcript"] = context_res.get("reviewed_transcript", dict_res["corrected_transcript"])
             result["context_corrections"] = context_res.get("corrections", [])
             result["context_correction_reasons"] = context_res.get("correction_reasons", [])
